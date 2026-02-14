@@ -39,8 +39,8 @@ function downloadFile(filename, text){
   URL.revokeObjectURL(url);
 }
 
-/* Persist across reload, clear on tab close = "exit site" behavior */
-const SESSION_KEY = "mcq_reviewer_state_v4";
+/* Persist across reload, clear on tab close */
+const SESSION_KEY = "mcq_reviewer_state_v5_scrollsafe";
 function loadSession(){
   try{ return JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); }catch{ return null; }
 }
@@ -65,7 +65,58 @@ let quizPlaceholder = null;
 
 const AUTO_NEXT_MS = 1100;
 
-/* PDF.js */
+/* ---------------------------
+   Scroll-safe tap protection
+---------------------------- */
+let lastScrollTs = 0;
+function markScrolled(){ lastScrollTs = Date.now(); }
+
+// capture scroll anywhere (page + modal)
+document.addEventListener("scroll", markScrolled, { passive: true, capture: true });
+
+// Block "clicks" that are really scroll-drags
+function wireScrollSafeTap(el){
+  let sx = 0, sy = 0;
+
+  el.addEventListener("pointerdown", (e) => {
+    sx = e.clientX; sy = e.clientY;
+    el.dataset.drag = "0";
+  }, { passive: true });
+
+  el.addEventListener("pointermove", (e) => {
+    const dx = Math.abs(e.clientX - sx);
+    const dy = Math.abs(e.clientY - sy);
+    if (dx > 12 || dy > 12) el.dataset.drag = "1";
+  }, { passive: true });
+
+  // If it was a drag or recent scroll, cancel click that would select the radio
+  el.addEventListener("click", (e) => {
+    const recentlyScrolled = (Date.now() - lastScrollTs) < 220;
+    if (el.dataset.drag === "1" || recentlyScrolled) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+}
+
+// Auto-next, but NEVER while user is actively scrolling
+function scheduleAutoNext(){
+  clearTimeout(autoNextTimer);
+
+  const tick = () => {
+    if ((Date.now() - lastScrollTs) < 220) {
+      autoNextTimer = setTimeout(tick, 220);
+      return;
+    }
+    nextQuestion();
+  };
+
+  autoNextTimer = setTimeout(tick, AUTO_NEXT_MS);
+}
+
+/* ---------------------------
+   PDF.js
+---------------------------- */
 async function ensurePdfJs(){
   if (window.pdfjsReady) await window.pdfjsReady;
   if (!window.pdfjsLib) throw new Error("PDF.js not loaded. Check lib/pdf.mjs and lib/pdf.worker.mjs.");
@@ -102,7 +153,9 @@ async function extractTextFromPdf(file){
   return normalizeText(allLines.join("\n"));
 }
 
-/* Parsing: supports "Answer Explanations" format */
+/* ---------------------------
+   Parsing: Answer Explanations
+---------------------------- */
 function parseMcqText(rawText){
   const text = normalizeText(rawText);
 
@@ -171,16 +224,14 @@ function parseMcqText(rawText){
   // Extract MCQs with A-D options
   const out = [];
   for(const b of blocks){
-    let body = b.body;
+    const body = b.body;
 
-    // Options A) / A. / A -
     const optRe = /(?:^|\n)\s*([A-D])\s*(?:[).:-])\s+/g;
     const optHits = [];
     let om;
     while((om = optRe.exec(body)) !== null){
       optHits.push({ idx: om.index, key: om[1].toUpperCase() });
     }
-
     if(optHits.length < 2) continue;
 
     const firstOptPos = optHits[0].idx + (body[optHits[0].idx] === "\n" ? 1 : 0);
@@ -206,7 +257,9 @@ function parseMcqText(rawText){
   return out.filter(q => q.question && q.options && q.options.length >= 3);
 }
 
-/* Reviewer modal */
+/* ---------------------------
+   Reviewer modal
+---------------------------- */
 function enterReviewerMode(){
   if(isReviewerMode) return;
 
@@ -247,7 +300,9 @@ function exitReviewerMode(){
   persist();
 }
 
-/* Quiz */
+/* ---------------------------
+   Quiz
+---------------------------- */
 function prepareQuizFresh(){
   const shuffleQ = $("#togShuffleQ").checked;
   const shuffleO = $("#togShuffleO").checked;
@@ -319,6 +374,9 @@ function renderQuestion(){
       <div class="t">${escapeHtml(o.text)}</div>
     `;
     form.appendChild(label);
+
+    // scroll-safe: prevent accidental select while scrolling
+    wireScrollSafeTap(label);
   });
 
   $("#btnNext").classList.add("hide");
@@ -326,12 +384,25 @@ function renderQuestion(){
   $("#fbTag").className = "tag";
   $("#fbText").textContent = "";
 
-  // Auto-submit on click
+  // Auto-submit on tap/click (but ignore if user just scrolled)
   form.onchange = () => {
     if(locked) return;
+    if ((Date.now() - lastScrollTs) < 220) return;
     const checked = form.querySelector('input[type="radio"]:checked');
     if(checked) submitAnswer();
   };
+
+  // If this question was already answered (restore on reload), show the state
+  const prev = answered[idx];
+  if(prev && prev.chosenKey){
+    const input = form.querySelector(`input[value="${CSS.escape(prev.chosenKey)}"]`);
+    if(input) input.checked = true;
+    locked = true;
+    showFeedback(!!prev.isCorrect, String(prev.chosenKey).toUpperCase());
+    $("#btnNext").classList.remove("hide");
+  } else {
+    locked = false;
+  }
 
   updateKPIs();
   persist();
@@ -370,7 +441,7 @@ function submitAnswer(){
 
   const chosenKey = checked.value.toUpperCase();
   const correctKey = (q.answerKey || "").toUpperCase();
-  const isCorrect = correctKey && chosenKey === correctKey;
+  const isCorrect = !!correctKey && chosenKey === correctKey;
 
   answered[idx] = { chosenKey, isCorrect };
   if(isCorrect) score += 1;
@@ -383,13 +454,14 @@ function submitAnswer(){
 
   clearTimeout(autoNextTimer);
   if(isCorrect){
-    autoNextTimer = setTimeout(nextQuestion, AUTO_NEXT_MS);
+    scheduleAutoNext(); // scroll-safe auto-next
   }
 }
 
 function nextQuestion(){
   clearTimeout(autoNextTimer);
   autoNextTimer = null;
+
   locked = false;
   idx += 1;
 
@@ -427,7 +499,9 @@ function finishQuiz(){
   persist();
 }
 
-/* Restore state on reload */
+/* ---------------------------
+   Restore on reload
+---------------------------- */
 function restore(){
   const st = loadSession();
   if(!st) return;
@@ -450,7 +524,6 @@ function restore(){
 
   updateKPIs();
 
-  // Update Start label to "Resume" if quiz exists
   if(quizQuestions.length && idx < quizQuestions.length){
     $("#btnStart").textContent = "Resume";
     $("#quizEmpty").textContent = "Resume your quiz any time. Refresh won’t reset it.";
@@ -464,12 +537,13 @@ function restore(){
   }
 
   if(st.isReviewerMode){
-    // reopen reviewer mode after reload if you were inside it
     enterReviewerMode();
   }
 }
 
-/* UI events */
+/* ---------------------------
+   UI events
+---------------------------- */
 $("#btnParse").addEventListener("click", async () => {
   const file = $("#pdfFile").files?.[0];
   if(!file){ setLog("Choose a PDF first."); return; }
@@ -482,8 +556,6 @@ $("#btnParse").addEventListener("click", async () => {
     $("#btnExportJson").disabled = parsedQuestions.length === 0;
     $("#btnStart").disabled = parsedQuestions.length === 0;
 
-    // If you parse new content, don’t force-reset the quiz automatically.
-    // You can choose to Reset if you want a fresh run.
     setLog(parsedQuestions.length ? `Parsed ${parsedQuestions.length} question(s).` : "Parsed 0 questions. Try Paste.");
     updateKPIs();
     persist();
@@ -498,7 +570,7 @@ $("#btnStart").addEventListener("click", () => {
 
   enterReviewerMode();
 
-  // If there is an existing quiz in-progress, resume it.
+  // Resume if already in-progress; otherwise start fresh
   if(!quizQuestions.length || idx >= quizQuestions.length){
     prepareQuizFresh();
   }
@@ -508,7 +580,12 @@ $("#btnStart").addEventListener("click", () => {
   setLog("");
 });
 
-$("#btnNext").addEventListener("click", nextQuestion);
+$("#btnNext").addEventListener("click", () => {
+  // if already answered and correct, timer might be waiting; stop it.
+  clearTimeout(autoNextTimer);
+  autoNextTimer = null;
+  nextQuestion();
+});
 
 $("#btnRestart").addEventListener("click", () => {
   if(!parsedQuestions.length){ setLog("Parse a PDF first."); return; }
